@@ -53,6 +53,14 @@ app.get('/api/v1/health', (req, res) => {
   });
 });
 
+// HD requirements route
+app.get('/api/student', (req, res) => {
+  res.json({
+    studentName: 'Aswin Soman',
+    studentID: '225287418',
+  });
+});
+
 // API documentation endpoint
 app.get('/api/v1', (req, res) => {
   res.json({

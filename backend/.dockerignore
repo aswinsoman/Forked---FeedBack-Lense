@@ -1,0 +1,15 @@
+node_modules
+.npmrc
+npm-debug.log
+Dockerfile*
+.dockerignore
+.git
+.gitignore
+.gitlab-ci.yml
+.vscode
+coverage
+dist
+build
+.env
+*.log
+.idea
