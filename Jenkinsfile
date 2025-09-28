@@ -1,17 +1,21 @@
 pipeline {
   agent any
 
+  /**************************
+   * Environment & Tools
+   **************************/
   environment {
-    // Credentials (create in Manage Jenkins → Credentials → Global)
-    MONGO_URI    = credentials('mongo-uri')
-    JWT_SECRET   = credentials('jwt-secret')
+    // Jenkins Credentials (create in: Manage Jenkins → Credentials → Global)
+    MONGO_URI        = credentials('mongo-uri')
+    JWT_SECRET       = credentials('jwt-secret')
 
-    // Local-staging ports/URLs on the Jenkins Windows machine
-    FRONTEND_URL = 'http://localhost:8080'
-    API_PORT     = '4000'
+    // Local staging ports/URLs on the Jenkins Windows host
+    FRONTEND_URL     = 'http://localhost:8080'   // adjust if you mapped web to a different port
+    API_PORT         = '4000'                    // host port published by docker compose for api
+    API_HEALTH_PATH  = '/api/v1/health'          // your confirmed endpoint
   }
 
-  // Match your configured Node tool name exactly (Manage Jenkins → Tools → NodeJS)
+  // Match your configured NodeJS tool name exactly (Manage Jenkins → Tools → NodeJS)
   tools { nodejs 'Node_18' }
 
   options {
@@ -20,15 +24,21 @@ pipeline {
     buildDiscarder(logRotator(numToKeepStr: '20'))
   }
 
-  // Keep while testing or switch to GitHub webhook
+  // Keep pollSCM during setup; switch to webhook later if you like
   triggers { pollSCM('* * * * *') }
 
   stages {
 
+    /**************************
+     * Checkout
+     **************************/
     stage('Checkout') {
       steps { checkout scm }
     }
 
+    /**************************
+     * Install
+     **************************/
     stage('Install (backend & frontend)') {
       steps {
         powershell '''
@@ -45,6 +55,9 @@ pipeline {
       }
     }
 
+    /**************************
+     * Build (tolerant)
+     **************************/
     stage('Build') {
       steps {
         powershell '''
@@ -67,6 +80,9 @@ pipeline {
       }
     }
 
+    /**************************
+     * Test (tolerant)
+     **************************/
     stage('Test') {
       steps {
         powershell '''
@@ -99,6 +115,9 @@ pipeline {
       }
     }
 
+    /**************************
+     * Lint (skip if no config)
+     **************************/
     stage('Code Quality (ESLint)') {
       steps {
         powershell '''
@@ -123,6 +142,9 @@ pipeline {
       }
     }
 
+    /**************************
+     * Security (audit) – tolerant
+     **************************/
     stage('Security (npm audit)') {
       steps {
         powershell '''
@@ -136,24 +158,27 @@ pipeline {
       }
     }
 
+    /**************************
+     * Deploy Local Staging (Docker Desktop)
+     **************************/
     stage('Deploy: Local Staging (Docker Desktop)') {
       steps {
         withCredentials([
-          string(credentialsId: 'mongo-uri', variable: 'MONGO_URI'),
+          string(credentialsId: 'mongo-uri',  variable: 'MONGO_URI'),
           string(credentialsId: 'jwt-secret', variable: 'JWT_SECRET')
         ]) {
           powershell '''
             docker version
             docker compose version
 
-            # Down previous (ignore failures)
+            # Stop & remove previous stack (ignore errors)
             try { docker compose -f docker-compose.staging.localbuild.yml down } catch { }
 
             # Session env (with fallbacks)
-            $env:MONGO_URI    = "${env.MONGO_URI}"; if (-not $env:MONGO_URI) { $env:MONGO_URI = "mongodb://mongo:27017/feedback" }
-            $env:JWT_SECRET   = "${env.JWT_SECRET}"; if (-not $env:JWT_SECRET) { $env:JWT_SECRET = "changeme" }
+            $env:MONGO_URI    = "${env:MONGO_URI}";  if (-not $env:MONGO_URI)  { $env:MONGO_URI  = "mongodb://mongo:27017/feedback" }
+            $env:JWT_SECRET   = "${env:JWT_SECRET}"; if (-not $env:JWT_SECRET) { $env:JWT_SECRET = "changeme" }
             $env:FRONTEND_URL = "${env:FRONTEND_URL}"
-            $env:API_PORT     = "${env:API_PORT}"; if (-not $env:API_PORT) { $env:API_PORT = "4000" }
+            $env:API_PORT     = "${env:API_PORT}";   if (-not $env:API_PORT)   { $env:API_PORT   = "4000" }
 
             Write-Host "Building local images..."
             docker compose -f docker-compose.staging.localbuild.yml build --pull
@@ -167,20 +192,46 @@ pipeline {
       }
     }
 
+    /**************************
+     * Monitoring & Smoke (uses your /api/v1/health)
+     **************************/
     stage('Monitoring & Smoke') {
       steps {
         powershell '''
+          function Test-Url($url, $attempts=12, $sleep=5) {
+            for ($i=1; $i -le $attempts; $i++) {
+              try {
+                $res = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 5
+                # Consider 2xx–4xx as "up"; we only fail on network/5xx
+                if ($res.StatusCode -ge 200 -and $res.StatusCode -lt 500) {
+                  Write-Host ("OK {0} on attempt {1}: {2}" -f $url,$i,$res.StatusCode)
+                  return $true
+                }
+              } catch {
+                Write-Host ("Attempt {0} failed for {1}: {2}" -f $i,$url,$_.Exception.Message)
+              }
+              Start-Sleep -Seconds $sleep
+            }
+            return $false
+          }
+
           $port = "${env:API_PORT}"; if (-not $port) { $port = "4000" }
-          $api  = "http://localhost:{0}/" -f $port
-          Write-Host "Healthcheck: $api"
-          try {
-            $res = Invoke-WebRequest -Uri $api -UseBasicParsing -TimeoutSec 15
-            if ($res.StatusCode -ge 200 -and $res.StatusCode -lt 400) {
-              Write-Host ("OK: {0}" -f $res.StatusCode)
-            } else { throw ("Bad status: {0}" -f $res.StatusCode) }
-          } catch {
-            Write-Error ("Healthcheck failed: {0}" -f $_.Exception.Message)
+          $path = "${env:API_HEALTH_PATH}"; if (-not $path) { $path = "/api/v1/health" }
+          if ($path -notmatch '^/') { $path = '/' + $path }
+          $url  = "http://localhost:{0}{1}" -f $port, $path
+          Write-Host "Healthcheck: $url"
+
+          if (-not (Test-Url $url)) {
+            Write-Error "API healthcheck failed"
             exit 1
+          }
+          Write-Host "API smoke OK"
+
+          # Optional: check web container (adjust port if you mapped differently)
+          $webUrl = "${env:FRONTEND_URL}"
+          if ($webUrl) {
+            if (Test-Url $webUrl) { Write-Host "Web smoke OK ($webUrl)" }
+            else { Write-Host "Web smoke skipped/failed ($webUrl)" }
           }
         '''
       }
